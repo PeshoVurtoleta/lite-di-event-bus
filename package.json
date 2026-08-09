@@ -1,0 +1,56 @@
+{
+  "name": "@zakkster/lite-di-event-bus",
+  "version": "1.0.0-alpha.1",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "description": "DI-constructed static event handlers under a boot-locked multi topology, dispatched by index over a shared buffer. Zero allocation on the synchronous emit path.",
+  "type": "module",
+  "main": "./EventBus.js",
+  "module": "./EventBus.js",
+  "types": "./EventBus.d.ts",
+  "exports": {
+    ".": {
+      "types": "./EventBus.d.ts",
+      "node": "./EventBus.js",
+      "import": "./EventBus.js",
+      "default": "./EventBus.js"
+    }
+  },
+  "scripts": {
+    "test": "node --expose-gc --test test/*.test.js",
+    "torture": "node --expose-gc test/torture.mjs",
+    "verify": "npm test && npm run torture",
+    "prepublishOnly": "npm run verify"
+  },
+  "files": [
+    "EventBus.js",
+    "EventBus.d.ts",
+    "LICENSE",
+    "llms.txt",
+    "CHANGELOG.md",
+    "COOKBOOK.md",
+    "README.md"
+  ],
+  "keywords": [
+    "event bus",
+    "dependency injection",
+    "di",
+    "emitter",
+    "multi binding",
+    "zero-gc",
+    "zero allocation",
+    "typescript"
+  ],
+  "license": "MIT",
+  "sideEffects": false,
+  "peerDependencies": {
+    "@zakkster/lite-di-container": ">=2.0.0"
+  },
+  "devDependencies": {
+    "@zakkster/lite-di-container": "^2.0.0",
+    "@zakkster/lite-gc-profiler": "^1.15.0",
+    "@zakkster/lite-leak": "^1.8.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

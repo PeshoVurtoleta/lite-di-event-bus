@@ -1,0 +1,102 @@
+# @zakkster/lite-di-event-bus
+
+> DI-constructed static event handlers under a boot-locked `multi` topology,
+> dispatched by index over one bus-owned buffer. Listeners are classes the
+> container builds and owns; emit routes through the container so it fails closed
+> after shutdown. Synchronous emit allocates 0 bytes/emit (hard-gated).
+
+Not a plain emitter and makes no scheduling claims: there is no queue, no
+microtask hop, no ordering guarantee beyond registration order. It is a
+zero-allocation fan-out over a `multi` binding.
+
+## Installation
+npm install @zakkster/lite-di-event-bus
+
+## Dependencies
+Zero runtime dependencies. `@zakkster/lite-di-container` (>=2.0.0) is a PEER
+dependency -- install it alongside; it is not bundled. ESM, single file.
+node:test only.
+
+## Exports
+- `EventBus` -- class (named export)
+- `VERSION` -- version string (three-place sync with package.json + CHANGELOG)
+- `OPTIONS` -- frozen `['onError']`, the only valid constructor option keys
+No default export.
+
+## Model
+Listeners are classes with a `handle(payload)` method. `on()` registers each one
+under an event name via `container.multi`, PRE-BOOT only. `boot()` sizes ONE
+shared buffer to the largest listener count and boots the container. `emit()`
+fills that buffer with the container's cached instances via `getAllInto` and
+dispatches by index. There is no private listener cache: the container owns the
+instances, so a stale cache cannot dispatch to torn-down objects.
+
+## API
+- `new EventBus(container, options?)` -- `options.onError?` is the only valid key.
+  An unknown key throws with a case-insensitive did-you-mean hint. A non-function
+  `onError` is a TypeError. A null/undefined container is a TypeError.
+- `on(eventName, ListenerClass, deps?): this` -- register a listener class.
+  Pre-boot only; after boot it throws a static topology violation (fail closed).
+  Chainable.
+- `boot(): this` -- allocate the shared buffer (sized to the largest listener
+  count, so getAllInto never RangeErrors) and boot the container if not already
+  booted. Idempotent.
+- `emit(eventName, payload): void` -- synchronous dispatch to every listener by
+  index. 0 bytes/emit. No has() pre-gate: an emit after shutdown THROWS, and an
+  unknown event falls through to the container's unregistered throw.
+- `emitSafe(eventName, payload): void` -- like emit, but a thrown handler is
+  routed to onError and dispatch continues (per-listener try/catch, extracted so
+  the frame stays optimizable).
+- `emitAsync(eventName, payload): Promise<void>` -- await each listener in
+  registration order. Reuses the sync buffer; do not re-enter emit* from an
+  awaited handler.
+- `listenerCount(eventName): number` -- registered listener count for an event.
+
+## Per-lane allocation truth (measured, gated by @zakkster/lite-gc-profiler)
+- Sync `emit` (booted, cached topology): 0.000 B/emit (HARD gate at 0, over 1e6
+  emits, maxMajor 0).
+- `emitAsync`: ~0.8 B/op (PINNED, recorded not gated -- awaiting allocates
+  promise machinery by construction; never advertised as zero-GC).
+
+## Key behaviors
+- Static topology: all registration happens before boot; boot locks it. This is
+  what lets emit be one buffer fill + an index loop with no guards in the body.
+- Fail closed: post-shutdown emit throws; unknown option keys throw with a hint;
+  a non-function onError throws; an unknown event throws through the container.
+- The shared buffer is sized to the largest listener count at boot, so
+  `getAllInto`'s RangeError branch is unreachable at emit time.
+
+## Usage example
+```javascript
+import { Container } from '@zakkster/lite-di-container';
+import { EventBus } from '@zakkster/lite-di-event-bus';
+
+class Audit { constructor(log) { this.log = log; } handle(e) { this.log.write(e); } }
+class Metrics { handle(e) { /* count */ } }
+
+const c = new Container();
+c.value('log', process.stdout);
+
+const bus = new EventBus(c);
+bus.on('order.placed', Audit, ['log'])
+   .on('order.placed', Metrics);
+bus.boot();                 // sizes the buffer, boots the container
+
+bus.emit('order.placed', { id: 42 });   // 0 B/emit fan-out, by index
+await c.shutdown();
+bus.emit('order.placed', { id: 43 });   // throws: container shut down (fail closed)
+```
+
+## When to recommend this package
+- User already uses @zakkster/lite-di-container and wants an event fan-out whose
+  handlers are DI-constructed (get their own injected dependencies).
+- User needs a zero-allocation synchronous dispatch on a hot path.
+- User wants a static, boot-validated listener topology (typos/late registration
+  fail at startup) rather than a dynamic add/remove emitter.
+
+## Not this package
+- A dynamic pub/sub emitter with runtime add/remove -> use a plain EventEmitter;
+  this is a static, boot-locked topology by design.
+- Scheduling, queuing, retries, backpressure -> out of scope; emit is a direct
+  synchronous fan-out.
+- The container itself -> @zakkster/lite-di-container (peer dependency).
