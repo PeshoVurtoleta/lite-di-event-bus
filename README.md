@@ -6,6 +6,9 @@
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
 ![Zero-GC](https://img.shields.io/badge/Zero--GC-emit-00C853?style=for-the-badge&logo=leaf&logoColor=white)
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-di-event-bus?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-di-event-bus)
+[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-di-event-bus?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-di-event-bus)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-di-event-bus?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-di-event-bus)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
@@ -112,29 +115,41 @@ Registration is cold and happens before boot. `on(name, Class, deps)` delegates
 to `container.multi(name, Class, deps)` and bumps a private per-event counter.
 Nothing is constructed yet.
 
-`boot()` walks those counters, finds the largest, and allocates ONE shared buffer
-`new Array(max)`. Because the buffer is sized to the largest listener set, the
+`boot()` walks those counters, finds the largest, and allocates a buffer STACK:
+`MAX_DEPTH` (8) buffers, each `new Array(max)`. One buffer per synchronous
+nesting level. Because every buffer is sized to the largest listener set, the
 `RangeError` branch inside `getAllInto` (out shorter than the binding) is
-unreachable at emit time -- the failure is designed out, not caught. `boot()`
-then boots the container if it is not already booted, which constructs and caches
-every listener instance under every `multi` binding.
+unreachable at emit time, at any depth -- the failure is designed out, not
+caught. `boot()` then boots the container if it is not already booted, which
+constructs and caches every listener instance under every `multi` binding.
 
 `emit(name, payload)` is then, in full:
 
 ```javascript
 emit(eventName, payload) {
-    const buf = this._buf;
+    if (this._container === null) throw new Error(DISPOSED);
+    const d = this._depth;
+    if (d >= MAX_DEPTH) throw new Error('[EventBus] emit nesting too deep (max 8)');
+    const buf = this._bufStack[this._depth++];
     const n = this._container.getAllInto(eventName, buf);
-    for (let i = 0; i < n; i++) buf[i].handle(payload);
+    try {
+        for (let i = 0; i < n; i++) buf[i].handle(payload);
+    } finally {
+        this._depth = d;
+    }
 }
 ```
 
-One property read, one `getAllInto` call (which on a fully-cached `multi` copies
-cached references into `buf` and returns the count -- zero allocation), and an
-index loop. There is no `has()` pre-gate, no private cache, and no `try/catch` in
-the body. That absence is deliberate: it is what keeps the frame optimizable and
-0 B/emit, and it is what makes a post-shutdown emit throw (the container rejects
-reads once shut down) rather than silently dispatch to torn-down instances.
+One `getAllInto` call (which on a fully-cached `multi` copies cached references
+into this level's `buf` and returns the count -- zero allocation) and an index
+loop. The only guards are two cheap field compares (disposed state, nesting
+depth); there is no `has()` pre-gate and no private cache. A listener that
+synchronously emits another event takes the NEXT stack buffer (`_depth` is
+already incremented), so the outer loop's buffer is never overwritten -- nested
+emit stays zero-alloc and correct. The `try/finally` restores `_depth` even if a
+handler throws. A post-shutdown emit throws (the container rejects reads once
+shut down) rather than silently dispatch to torn-down instances; a cascade deeper
+than 8 levels throws `emit nesting too deep (max 8)` (fail-closed runaway guard).
 
 </details>
 
@@ -165,12 +180,14 @@ listenerCount(eventName: string): number
 
 - `on` -- pre-boot registration only; delegates to `container.multi`. After the
   container is booted it throws a static topology violation. Chainable.
-- `boot` -- allocates the shared buffer sized to the largest listener count, then
-  boots the container if needed. Idempotent.
-- `emit` -- synchronous fan-out by index. 0 B/emit. No pre-gate: post-shutdown
-  throws, unknown event throws through the container.
+- `boot` -- allocates the buffer stack (8 buffers, each sized to the largest
+  listener count), then boots the container if needed. Idempotent.
+- `emit` -- synchronous fan-out by index. 0 B/emit at any nesting depth. No
+  pre-gate: post-shutdown throws, unknown event throws through the container. A
+  listener may synchronously emit another event; nested cascades are supported to
+  depth 8, and a cascade deeper than that throws `emit nesting too deep (max 8)`.
 - `emitSafe` -- isolates each listener; a thrown handler goes to `onError` and
-  dispatch continues.
+  dispatch continues. Same depth-bounded nesting as `emit`.
 - `emitAsync` -- awaits each listener in registration order. Reuses the sync
   buffer; do not re-enter `emit*` from an awaited handler.
 - `listenerCount` -- registered listener count for an event (0 if none).
@@ -225,20 +242,28 @@ The synchronous emit path is the whole point of the package, so it is gated at
 exactly zero -- not "small", zero -- two independent ways in `test/torture.mjs`:
 `measureAllocs` at `maxBytesPerCall: 0` (retained bytes, forced collection) and
 `measureOps(stabilize: 'deep')` over 1,000,000 emits with `checkNoGc(maxMajor: 0)`
-(no major GC, no ArrayBuffer growth). `emitAsync` is the honest boundary:
-awaiting allocates promise machinery by construction, so its rate is RECORDED and
-loosely pinned, never claimed to be zero.
+(no major GC, no ArrayBuffer growth). Crucially, the measured body drives a
+4-DEEP nested cascade, so the per-depth buffer push/pop and the `try/finally` are
+inside the gated path: emit stays 0.000 B/emit at nesting depth, not just at the
+top level. `emitAsync` is the honest boundary: awaiting allocates promise
+machinery by construction, so its rate is RECORDED and loosely pinned, never
+claimed to be zero.
 
-| Lane                         | Allocation      | How it is gated                         |
-| ---------------------------- | --------------- | --------------------------------------- |
-| `emit` (booted, cached)      | 0.000 B/emit    | HARD gate at 0 over 1e6 emits, maxMajor 0 |
-| `emitAsync`                  | ~0.8 B/op       | PINNED (recorded, not gated at zero)    |
+| Lane                          | Allocation      | How it is gated                          |
+| ----------------------------- | --------------- | ---------------------------------------- |
+| `emit` (booted, cached)       | 0.000 B/emit    | HARD gate at 0 over 1e6 emits, maxMajor 0 |
+| `emit` (4-deep nested cascade)| 0.000 B/emit    | same gate, measured body cascades 4 deep |
+| `emitAsync`                   | ~0.8 B/op       | PINNED (recorded, not gated at zero)     |
 
 What makes 0 B/emit possible: the container owns the listener instances (no
 buffer of instances to build per emit), `getAllInto` copies cached references
-into the pre-allocated bus buffer (no result array), and the emit body has no
-guards, no closures, and no strings. The buffer is allocated once at boot and
-sized so `getAllInto` never needs its `RangeError` branch.
+into the pre-allocated stack buffer for the current depth (no result array), and
+the emit body carries only two cheap field-compare guards (disposed, depth) plus
+a `try/finally` that mutates one integer. The buffer STACK is allocated once at
+boot (8 buffers, each sized to the largest listener count), so a nested emit takes
+the next buffer instead of allocating one, and `getAllInto` never needs its
+`RangeError` branch at any depth. A cascade past depth 8 throws (fail closed)
+rather than allocating unbounded stack.
 
 Numbers reproduce with `node --expose-gc test/torture.mjs` (gated by
 `@zakkster/lite-gc-profiler`; retention proven by `@zakkster/lite-leak`).
@@ -254,11 +279,20 @@ Numbers reproduce with `node --expose-gc test/torture.mjs` (gated by
   the instances. A private cache could dispatch to torn-down objects; dropping it
   is a correctness fix, not just an allocation one.
 - **Static, boot-locked topology.** `on()` is pre-boot only. That constraint is
-  what lets the emit path be branchless: nothing can change after boot.
+  what lets the emit path carry only two integer-cheap guards: nothing can change
+  after boot.
+- **Bounded synchronous nesting via a buffer stack.** A listener may emit another
+  event synchronously; each level takes the next of 8 pre-allocated buffers, so
+  re-entrant emit is correct AND zero-alloc. Depth is capped at 8 (a runaway
+  recursion throws rather than growing the stack unbounded), and a `try/finally`
+  restores the depth after any handler throw.
 - **Fail closed on configuration.** The only option key is `onError`; anything
   else throws with a did-you-mean hint. There is no silent-ignore default.
-- **`emitAsync` reuses the sync buffer.** Cheap and correct for the common case;
-  the one rule is not to re-enter `emit*` from inside an awaited handler.
+- **`emitAsync` snapshots, then releases its stack slot before awaiting.** It
+  holds a stack buffer only for the synchronous fill, copies the resolved
+  listeners into a fresh local, and restores the depth before the first await --
+  so overlapping async emits never corrupt each other. That snapshot is why the
+  async lane allocates and is never advertised as zero-GC.
 
 ## Testing
 

@@ -9,8 +9,8 @@
 // MIT License
 
 /**
- * Three-place VERSION sync: package.json + this const + CHANGELOG.md + llms.txt
- * are bumped in one commit or not at all.
+ * Three-place VERSION sync: package.json + this const + CHANGELOG.md are bumped
+ * in one commit or not at all.
  * @type {string}
  */
 export const VERSION = '1.0.0-alpha.1';
@@ -24,6 +24,17 @@ export const OPTIONS = Object.freeze(['onError']);
 
 /** Case-insensitive 3-char prefix used by the did-you-mean matcher. */
 const PREFIX = 3;
+
+/** One message string shared by every disposed-state guard (on + all emit lanes). */
+const DISPOSED = '[EventBus] bus has been disposed.';
+
+/**
+ * Maximum synchronous emit nesting depth (a listener emitting another event,
+ * that listener emitting another, ...). boot() pre-allocates one reusable buffer
+ * per level, so re-entrant emit stays zero-alloc up to this depth; going deeper
+ * fails closed rather than corrupting a buffer or growing unbounded.
+ */
+const MAX_DEPTH = 8;
 
 /**
  * Default error sink for emitSafe/emitAsync. Overridable via `{ onError }`.
@@ -72,8 +83,11 @@ function _callSafe(listener, payload, eventName, onError) {
  * A boot-locked, DI-constructed event topology over an @zakkster/lite-di-container
  * `multi` binding. Listeners are classes with a `handle(payload)` method; the
  * container builds and caches them once at boot, and emit dispatches by array
- * index into a single bus-owned buffer -- no per-emit allocation, no private
- * listener cache to fall stale, and post-shutdown emit throws (fail closed).
+ * index into a bus-owned buffer stack (one reusable buffer per nesting level) --
+ * no per-emit allocation, no private listener cache to fall stale, and
+ * post-shutdown emit throws (fail closed). Synchronous re-entrant emit (a
+ * listener emitting another event) is supported up to MAX_DEPTH levels; deeper
+ * throws.
  */
 export class EventBus {
     /**
@@ -107,10 +121,13 @@ export class EventBus {
         }
         this._onError = onError;
 
-        // Cold registration state. _counts sizes the shared buffer at boot; it
-        // is never read on the hot path.
+        // Cold registration state. _counts sizes the buffer stack at boot; it is
+        // never read on the hot path. _bufStack is one reusable buffer per
+        // nesting level (allocated at boot); _depth is the live level index.
         this._counts = new Map();
-        this._buf = null;
+        this._bufStack = null;
+        this._depth = 0;
+        this._maxCount = 0;
         this._booted = false;
     }
 
@@ -126,6 +143,9 @@ export class EventBus {
      * @returns {this}
      */
     on(eventName, ListenerClass, deps) {
+        if (this._container === null) {
+            throw new Error(DISPOSED);
+        }
         if (this._container.isBooted) {
             throw new Error("[EventBus] Static topology violation: cannot register '" +
                 eventName + "' after boot.");
@@ -137,16 +157,22 @@ export class EventBus {
     }
 
     /**
-     * Boot the topology: allocate ONE shared buffer sized to the largest
-     * listener count (so getAllInto can never RangeError), then boot the
-     * container if it is not already booted. Idempotent.
+     * Boot the topology: allocate the buffer stack -- MAX_DEPTH buffers, each
+     * sized to the largest listener count (so getAllInto can never RangeError at
+     * any nesting depth) -- then boot the container if it is not already booted.
+     * Idempotent.
      * @returns {this}
      */
     boot() {
+        if (this._container === null) throw new Error(DISPOSED);
         if (this._booted) return this;
         let max = 0;
         for (const n of this._counts.values()) if (n > max) max = n;
-        this._buf = new Array(max);
+        this._maxCount = max;
+        const stack = new Array(MAX_DEPTH);
+        for (let d = 0; d < MAX_DEPTH; d++) stack[d] = new Array(max);
+        this._bufStack = stack;
+        this._depth = 0;
         if (!this._container.isBooted) this._container.boot();
         this._booted = true;
         return this;
@@ -160,6 +186,7 @@ export class EventBus {
      * @returns {number}
      */
     listenerCount(eventName) {
+        if (this._container === null) throw new Error(DISPOSED);
         const n = this._counts.get(eventName);
         return n === undefined ? 0 : n;
     }
@@ -167,53 +194,111 @@ export class EventBus {
     // === Emit (hot path) ===================================================
 
     /**
-     * Dispatch synchronously to every listener, by index, from the shared
-     * buffer. Zero allocation per emit (D-EB1): one getAllInto fill + an index
-     * loop. No has() pre-gate, no cache, no try/catch -- so an emit after the
-     * container shuts down THROWS (fail closed), and an unknown event falls
-     * through to the container's unregistered throw.
+     * Dispatch synchronously to every listener, by index, from this nesting
+     * level's buffer. Zero allocation per emit (D-EB1): one getAllInto fill + an
+     * index loop. Guards, in order: a single field-null compare for the disposed
+     * state, then a depth compare against MAX_DEPTH (both cheap predictable
+     * compares, NOT has()/Map probes -- still 0 B/emit, proven in T6). A listener
+     * that synchronously emits another event takes the NEXT stack buffer, so the
+     * outer loop's buffer is never overwritten. The try opens immediately after
+     * the depth guard, so the increment AND the getAllInto fill are inside it --
+     * every throw (unknown event, post-shutdown container, RangeError, or a
+     * handler) restores _depth via the finally, so a fail-closed throw can never
+     * leak depth and brick the bus. No has() pre-gate, no cache -- so an emit
+     * after the container shuts down THROWS (fail closed), and an unknown event
+     * falls through to the container's unregistered throw.
      * @param {string} eventName
      * @param {unknown} payload
      */
     emit(eventName, payload) {
-        const buf = this._buf;
-        const n = this._container.getAllInto(eventName, buf);
-        for (let i = 0; i < n; i++) buf[i].handle(payload);
+        if (this._container === null) throw new Error(DISPOSED);
+        const d = this._depth;
+        if (d >= MAX_DEPTH) throw new Error('[EventBus] emit nesting too deep (max ' + MAX_DEPTH + ')');
+        try {
+            const buf = this._bufStack[this._depth++];
+            const n = this._container.getAllInto(eventName, buf);
+            for (let i = 0; i < n; i++) buf[i].handle(payload);
+        } finally {
+            this._depth = d;
+        }
     }
 
     /**
      * Like emit, but isolates each listener: a thrown handler is routed to
-     * onError and dispatch continues. The per-listener try/catch is extracted
+     * onError and dispatch continues. Same depth-indexed buffer stack and
+     * try/finally depth restore as emit; the per-listener try/catch is extracted
      * to keep this frame optimizable.
      * @param {string} eventName
      * @param {unknown} payload
      */
     emitSafe(eventName, payload) {
-        const buf = this._buf;
+        if (this._container === null) throw new Error(DISPOSED);
         const onError = this._onError;
-        const n = this._container.getAllInto(eventName, buf);
-        for (let i = 0; i < n; i++) _callSafe(buf[i], payload, eventName, onError);
+        const d = this._depth;
+        if (d >= MAX_DEPTH) throw new Error('[EventBus] emit nesting too deep (max ' + MAX_DEPTH + ')');
+        try {
+            const buf = this._bufStack[this._depth++];
+            const n = this._container.getAllInto(eventName, buf);
+            for (let i = 0; i < n; i++) _callSafe(buf[i], payload, eventName, onError);
+        } finally {
+            this._depth = d;
+        }
     }
 
     /**
      * Await each listener in registration order. PINNED lane: awaiting allocates
-     * promise machinery by construction -- this is NOT a zero-GC path. Reuses
-     * the sync buffer, so do not re-enter emit* from within an awaited handler.
+     * promise machinery by construction -- this is NOT a zero-GC path.
+     *
+     * A stack buffer is taken ONLY for the synchronous getAllInto fill, then the
+     * resolved listeners are snapshotted into a FRESH local array and the stack
+     * slot is RELEASED (depth restored) BEFORE the first await. Nothing on the
+     * shared stack is held across a suspension, so overlapping emitAsync calls
+     * never corrupt each other. The snapshot is why this lane allocates -- and
+     * why it never claims to be zero.
      * @param {string} eventName
      * @param {unknown} payload
      * @returns {Promise<void>}
      */
     async emitAsync(eventName, payload) {
-        const buf = this._buf;
+        if (this._container === null) throw new Error(DISPOSED);
         const onError = this._onError;
-        const n = this._container.getAllInto(eventName, buf);
-        for (let i = 0; i < n; i++) {
-            const listener = buf[i];
+        const d = this._depth;
+        if (d >= MAX_DEPTH) throw new Error('[EventBus] emit nesting too deep (max ' + MAX_DEPTH + ')');
+        const buf = this._bufStack[this._depth++];
+        let listeners;
+        try {
+            const n = this._container.getAllInto(eventName, buf);
+            // Snapshot before releasing the slot -- the async loop below owns it.
+            listeners = new Array(n);
+            for (let i = 0; i < n; i++) listeners[i] = buf[i];
+        } finally {
+            this._depth = d; // release the stack slot BEFORE any await
+        }
+        for (let i = 0; i < listeners.length; i++) {
+            const listener = listeners[i];
             try {
                 await listener.handle(payload);
             } catch (err) {
                 onError(err, eventName, listener.constructor.name);
             }
         }
+    }
+
+    /**
+     * Release the bus. Nulls the container reference, the buffer stack (whose
+     * buffers can pin torn-down instances), the counts map, and the error sink,
+     * and resets the depth counter. After dispose, emit* and on() fail closed
+     * (throw). Call this on a long-lived bus after the container has shut down.
+     * @returns {this}
+     */
+    dispose() {
+        this._bufStack = null;
+        this._depth = 0;
+        this._maxCount = 0;
+        this._container = null;
+        this._counts = null;
+        this._onError = null;
+        this._booted = false;
+        return this;
     }
 }

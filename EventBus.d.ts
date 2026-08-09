@@ -52,4 +52,11 @@ export declare class EventBus {
 
     /** Await each listener in registration order. Allocates by construction. */
     emitAsync(eventName: string, payload?: unknown): Promise<void>;
+
+    /**
+     * Release the bus: null the container, shared buffer, counts map, and error
+     * sink. After dispose, emit* and on() fail closed (throw). Call on a
+     * long-lived bus once the container has shut down.
+     */
+    dispose(): this;
 }

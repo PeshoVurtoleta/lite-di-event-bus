@@ -25,11 +25,20 @@ No default export.
 
 ## Model
 Listeners are classes with a `handle(payload)` method. `on()` registers each one
-under an event name via `container.multi`, PRE-BOOT only. `boot()` sizes ONE
-shared buffer to the largest listener count and boots the container. `emit()`
-fills that buffer with the container's cached instances via `getAllInto` and
+under an event name via `container.multi`, PRE-BOOT only. `boot()` allocates a
+buffer STACK -- one reusable buffer per nesting level (MAX_DEPTH = 8), each sized
+to the largest listener count -- and boots the container. `emit()` fills this
+nesting level's buffer with the container's cached instances via `getAllInto` and
 dispatches by index. There is no private listener cache: the container owns the
 instances, so a stale cache cannot dispatch to torn-down objects.
+
+Synchronous nested emit is supported: a listener may call `emit`/`emitSafe` for
+another event from inside its own `handle`. Each nested emit takes the NEXT stack
+buffer, so the outer dispatch is never corrupted and nesting stays zero-alloc.
+Nesting is bounded at depth 8; a cascade deeper than that throws
+`[EventBus] emit nesting too deep (max 8)` (a fail-closed runaway-recursion
+guard). A `try/finally` restores the depth after any throw, so the bus stays
+usable.
 
 ## API
 - `new EventBus(container, options?)` -- `options.onError?` is the only valid key.
@@ -38,12 +47,14 @@ instances, so a stale cache cannot dispatch to torn-down objects.
 - `on(eventName, ListenerClass, deps?): this` -- register a listener class.
   Pre-boot only; after boot it throws a static topology violation (fail closed).
   Chainable.
-- `boot(): this` -- allocate the shared buffer (sized to the largest listener
-  count, so getAllInto never RangeErrors) and boot the container if not already
-  booted. Idempotent.
+- `boot(): this` -- allocate the buffer stack (8 buffers, each sized to the
+  largest listener count, so getAllInto never RangeErrors at any depth) and boot
+  the container if not already booted. Idempotent.
 - `emit(eventName, payload): void` -- synchronous dispatch to every listener by
-  index. 0 bytes/emit. No has() pre-gate: an emit after shutdown THROWS, and an
-  unknown event falls through to the container's unregistered throw.
+  index. 0 bytes/emit at any nesting depth. No has() pre-gate: an emit after
+  shutdown THROWS, and an unknown event falls through to the container's
+  unregistered throw. A listener may synchronously emit another event (nested,
+  bounded at depth 8; deeper throws `emit nesting too deep (max 8)`).
 - `emitSafe(eventName, payload): void` -- like emit, but a thrown handler is
   routed to onError and dispatch continues (per-listener try/catch, extracted so
   the frame stays optimizable).
@@ -54,17 +65,26 @@ instances, so a stale cache cannot dispatch to torn-down objects.
 
 ## Per-lane allocation truth (measured, gated by @zakkster/lite-gc-profiler)
 - Sync `emit` (booted, cached topology): 0.000 B/emit (HARD gate at 0, over 1e6
-  emits, maxMajor 0).
+  emits, maxMajor 0). Unchanged at any nesting depth -- the T6 gate measures a
+  4-deep nested cascade and still reads 0.000 B/emit (the depth push/pop and the
+  try/finally add no allocation).
 - `emitAsync`: ~0.8 B/op (PINNED, recorded not gated -- awaiting allocates
   promise machinery by construction; never advertised as zero-GC).
 
 ## Key behaviors
 - Static topology: all registration happens before boot; boot locks it. This is
-  what lets emit be one buffer fill + an index loop with no guards in the body.
+  what lets emit be one buffer fill + an index loop with only cheap field-compare
+  guards (disposed state, nesting depth) in the body.
+- Synchronous nested emit is supported and zero-alloc up to depth 8: each nested
+  emit takes the next pre-allocated stack buffer, so a listener emitting another
+  event never corrupts the outer dispatch. Deeper than 8 throws
+  `[EventBus] emit nesting too deep (max 8)` -- a fail-closed runaway-recursion
+  guard; the depth is restored via try/finally after any throw.
 - Fail closed: post-shutdown emit throws; unknown option keys throw with a hint;
-  a non-function onError throws; an unknown event throws through the container.
-- The shared buffer is sized to the largest listener count at boot, so
-  `getAllInto`'s RangeError branch is unreachable at emit time.
+  a non-function onError throws; an unknown event throws through the container;
+  a cascade past depth 8 throws rather than growing unbounded.
+- Each stack buffer is sized to the largest listener count at boot, so
+  `getAllInto`'s RangeError branch is unreachable at emit time, at any depth.
 
 ## Usage example
 ```javascript

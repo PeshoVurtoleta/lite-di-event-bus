@@ -50,6 +50,19 @@
     "@zakkster/lite-gc-profiler": "^1.15.0",
     "@zakkster/lite-leak": "^1.8.1"
   },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-di-event-bus#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-di-event-bus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-di-event-bus/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
   "engines": {
     "node": ">=18"
   }
