@@ -302,7 +302,15 @@ Numbers reproduce with `node --expose-gc test/torture.mjs` (gated by
   the async lane, T7 soak (2000 cycles, lite-leak retention + heap bound), T9
   controls (each gate proven able to fail: `DI_ASCII_BREAK`, `DI_ALLOC_BREAK`,
   `DI_TORTURE_BREAK`).
-- `npm run verify` -- both, in order. `prepublishOnly` runs `verify`.
+- `npm run example` -- [`examples/order-pipeline.mjs`](examples/order-pipeline.mjs): a
+  shipped, self-verifying reference consumer. An order-processing fan-out with
+  DI-constructed listeners, a nested emit (`order.placed` -> a handler emits
+  `email.queued`), error-isolated `emitSafe`, `emitAsync`, `listenerCount`, `dispose`,
+  and the fail-closed paths (on()-after-boot, unknown event, unknown option, non-function
+  onError, null container, post-shutdown emit, the distinct post-dispose emit, and the
+  depth-8 runaway guard). Every claim is asserted with `node:assert`, so a broken
+  contract exits non-zero. It is the downstream proof that the 1.0.0 API works in anger.
+- `npm run verify` -- all three, in order. `prepublishOnly` runs `verify`.
 
 ## What this is not
 
