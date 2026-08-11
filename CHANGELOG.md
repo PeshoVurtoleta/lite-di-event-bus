@@ -5,6 +5,66 @@ format follows Keep a Changelog; the project uses semantic versioning. The
 version is synced in three places at once: `package.json`, the `VERSION` const in
 `EventBus.js`, and this file's top entry.
 
+## [1.1.0] - 2026-08-12
+
+A flight recorder folded into the bus: an opt-in, bounded tape that captures every
+emitted `(name, payload)` and can synchronously re-drive them through `emit`. It is
+a passive recorder, not a scheduler -- it records what already fired in the same
+frame and replay is a direct synchronous re-drive (no queue, no microtask, no
+timer, no retries). Additive minor: the three exports (`EventBus`, `VERSION`,
+`OPTIONS`) and the frozen `OPTIONS` are byte-identical -- recording is a runtime
+method, not a constructor option.
+
+### Added
+- `record(capacity, opts?): this` -- begin capturing into a FIXED ring of exactly
+  `capacity` slots, pre-allocated once. `opts.onOverflow` is the full-ring policy:
+  `'drop-oldest'` (default -- flight-recorder semantics: keep the most recent
+  `capacity` events, rotate, and make loss visible via `dropped()`) or `'throw'`
+  (exact-capture semantics: the `capacity+1`-th emit throws inside `emit`; the bus
+  stays usable). Fails closed: a disposed bus throws; a non-integer or `<= 0`
+  `capacity` throws naming it; an unknown option throws with a did-you-mean hint; a
+  second `record()` while already recording throws (`stopRecording()` first).
+- `stopRecording(): this` -- halt capture, RETAINING the tape and every captured
+  payload reference so `replay()` still works. Idempotent.
+- `replay(): number` -- synchronously re-drive every recorded entry through `emit()`
+  in capture order, before the next statement runs, and return the count. Recording
+  is suspended for the duration (a `_replaying` latch, restored in `finally`) so the
+  re-drive never self-records. A never-recorded or empty tape returns `0` (absence
+  is a valid empty, not an error). A disposed bus throws; a re-entrant `replay()`
+  throws.
+- `recorded(): number` -- entries currently held in the tape (never exceeds
+  `capacity`; `0` when never recorded or after `clearTape()`).
+- `dropped(): number` -- entries overwritten under `'drop-oldest'` overflow, so loss
+  is VISIBLE (fail-loud via a counter, never a silent drop). Always `0` under
+  `'throw'`.
+- `clearTape(): this` -- release every retained payload reference (null the ring
+  slots so a `WeakRef` to a recorded payload becomes collectable) and reset
+  head/count/dropped. The ring arrays are REUSED, not reallocated. Idempotent;
+  recording continues if it was active. `dispose()` also nulls the tape, so it never
+  outlives the bus.
+
+### Proven
+- The release-guarding invariant HELD: with the recorder off (the default), the
+  synchronous `emit` hot path adds exactly one `this._tape === null` field compare
+  and STILL measures 0.000 B/emit over 1,000,000 emits (T6). The recorder-ON lane is
+  a SEPARATE 0-B path: capture is pure reference stores into the pre-allocated ring
+  (`recorderOn=0.000 B/emit` this run), never an allocation.
+- Retention released: the T7 soak adds 500 record -> emit -> clearTape/dispose rounds
+  and proves a `WeakRef` to a cleared payload becomes collectable; the finalization
+  residual stays within the fixed ceiling (`size() 1/16`), `gc major=0 minor=0`.
+- `node:test`: 45 -> 88 (a new boundary suite, `test/EventBus.record-replay.test.js`,
+  covers capture order and identity, no-self-record on replay, the re-entrant-replay
+  throw, empty-returns-0, both overflow policies, disposed/validation fail-closed
+  paths, and the clearTape/dispose retention release).
+
+### Note on the off-path cost after stopRecording/clearTape
+`_tape === null` is the pure single-compare hot path (never recorded, or after
+`dispose`). Once a tape has been allocated, `stopRecording()` and `clearTape()` leave
+`_tape` non-null, so `emit` pays a `_capture` call that early-returns at still-0-B
+rather than the bare compare. This is by design -- retaining the tape is what lets
+`replay()` work after `stopRecording()`; only `dispose()` restores the pure
+single-compare. No allocation either way.
+
 ## [1.0.0] - 2026-08-11
 
 Promotion to stable. The public surface is frozen exactly as shipped at
@@ -106,5 +166,6 @@ package exists to exercise).
 - ASCII-only source; zero runtime dependencies (the container is a peer
   dependency, not bundled).
 
+[1.1.0]: https://www.npmjs.com/package/@zakkster/lite-di-event-bus
 [1.0.0]: https://www.npmjs.com/package/@zakkster/lite-di-event-bus
 [1.0.0-alpha.1]: https://www.npmjs.com/package/@zakkster/lite-di-event-bus

@@ -45,8 +45,10 @@ const EMITS_PER_ROUND = 16;
 const NESTED_ROUNDS = 500;
 const NESTED_EMITS_PER_ROUND = 32;
 const NESTED_DEPTH = 4;   // populates _bufStack[0..3], within MAX_DEPTH=8
+const REC_ROUNDS = 500;   // record -> clearTape -> dispose rounds (A-RR-6)
+const REC_CAP = 64;       // recorder ring capacity for the soak
 
-const TOTAL = CYCLES + ROUNDS + NESTED_ROUNDS; // 3000 buses tracked
+const TOTAL = CYCLES + ROUNDS + NESTED_ROUNDS + REC_ROUNDS; // 3500 buses tracked
 /** AUTHORITY residual ceiling. Clean leaves single digits; a real leak leaves ~TOTAL. */
 const RES = Math.max(16, (TOTAL / 1000) | 0);  // 16
 
@@ -60,6 +62,17 @@ const NOOP = function () {};
 
 /** BREAK: retains every tracked bus so it can NEVER be finalized -> size() stays ~TOTAL. */
 const sink = [];
+
+/**
+ * Record ONE fresh payload and return a WeakRef to it. The strong reference lives
+ * ONLY in this frame (held-value discipline), so after clearTape nulls the ring
+ * slot nothing keeps the payload alive -- a settled WeakRef must deref to undefined.
+ */
+function recordOne(bus) {
+    const payload = { cleared: true };
+    bus.emit('e', payload);
+    return new WeakRef(payload);
+}
 
 /** Hard settle: run FinalizationRegistry callbacks to ground before reading size(). */
 async function settleHard() {
@@ -174,6 +187,53 @@ export async function run() {
         if (BREAK) sink.push(bus);
     }
 
+    // ---- Sub-phase 4: record -> clearTape -> dispose (A-RR-6 retention) ---------
+    // Each round records into a fixed ring, drives it PAST capacity (drop-oldest),
+    // clearTape() to release the retained payload refs, then shutdown + dispose.
+    // The tape is a DELIBERATE retention; dispose must null it so it never outlives
+    // the bus. Field-null release + fail-closed-after-dispose asserted per round.
+    for (let r = 0; r < REC_ROUNDS; r++) {
+        const c = new Container();
+        const bus = new EventBus(c);
+        class L { handle() {} }
+        bus.on('e', L);
+        bus.boot();
+        bus.record(REC_CAP);
+        for (let e = 0; e < REC_CAP * 2; e++) bus.emit('e', { seq: e });
+        check(bus.recorded() === REC_CAP,
+            () => `T7.rec: round ${r} recorded() ${bus.recorded()} != ${REC_CAP}`);
+        check(bus.recorded() + bus.dropped() === REC_CAP * 2,
+            () => `T7.rec: round ${r} accounting off (${bus.recorded()}+${bus.dropped()} != ${REC_CAP * 2})`);
+        bus.clearTape();
+        check(bus.recorded() === 0 && bus.dropped() === 0,
+            () => `T7.rec: round ${r} clearTape did not reset counters`);
+
+        await c.shutdown();
+        bus.dispose();
+        check(bus._tape === null, () => `T7.rec: round ${r} dispose did not null the tape`);
+        let threw = false;
+        try { bus.record(4); } catch { threw = true; }
+        check(threw, () => `T7.rec: round ${r} record after dispose did not fail closed`);
+
+        tracker.track(bus, NOOP, 'rec-bus' + r);
+        if (BREAK) sink.push(bus);
+    }
+
+    // A-RR-6 DIRECT: a WeakRef to a cleared payload becomes collectable ----------
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        class L { handle() {} }
+        bus.on('e', L);
+        bus.boot();
+        bus.record(4);
+        const ref = recordOne(bus); // records a fresh payload; no strong ref escapes
+        bus.clearTape();
+        await settleHard();
+        check(ref.deref() === undefined,
+            () => 'T7.rec: a WeakRef to a cleared payload survived clearTape -- retention NOT released');
+    }
+
     // ---- AUTHORITY: finalization residual across ALL tracked buses -------------
     await settleHard();
     const residual = tracker.size();
@@ -194,6 +254,6 @@ export async function run() {
         () => `T7.heap: (secondary) soak heap delta ${(delta / 1024).toFixed(1)} KB >= ${(HEAP_DELTA_LIMIT / 1024)} KB`);
 
     process.stderr.write('T7 soak: ' + CYCLES + ' fresh + ' + ROUNDS + ' dispose + ' + NESTED_ROUNDS +
-        ' nested rounds clean | AUTHORITY residual size()=' + residual + '/' + RES +
+        ' nested + ' + REC_ROUNDS + ' record rounds clean | AUTHORITY residual size()=' + residual + '/' + RES +
         ' findings=' + findings.length + ' | (secondary) heap delta=' + (delta / 1024).toFixed(1) + ' KB\n');
 }

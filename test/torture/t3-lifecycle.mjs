@@ -259,4 +259,163 @@ export async function run() {
         check(sfThrew, () => 'T3.S1depth: post-shutdown emitSafe did not fail closed');
         check(bus._depth === 0, () => `T3.S1depth: emitSafe _depth leaked to ${bus._depth} after post-shutdown throw`);
     }
+
+    // === Flight recorder -- record / replay (1.1, GAP-5) ====================
+
+    // -- A-RR-3/2: record 3 -> replay re-drives in capture order, same payload
+    //    references, and does NOT self-record ------------------------------------
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        const seen = [];
+        const p0 = { n: 0 }, p1 = { n: 1 }, p2 = { n: 2 };
+        class L { handle(p) { seen.push(p); } }
+        bus.on('e', L);
+        bus.boot();
+        bus.record(8);
+        bus.emit('e', p0); bus.emit('e', p1); bus.emit('e', p2);
+        check(bus.recorded() === 3, () => `T3.RR: recorded() ${bus.recorded()} != 3`);
+        check(seen.length === 3, () => `T3.RR: live emit dispatched ${seen.length} != 3`);
+
+        const n = bus.replay();
+        check(n === 3, () => `T3.RR: replay() returned ${n} != 3`);
+        check(seen.length === 6, () => `T3.RR: replay did not re-invoke the handler (seen=${seen.length})`);
+        // Capture ORDER + payload IDENTITY (the SAME references, not copies).
+        check(seen[3] === p0 && seen[4] === p1 && seen[5] === p2,
+            () => 'T3.RR: replay order or payload identity wrong');
+        // Replay must not self-record (_replaying suspends capture).
+        check(bus.recorded() === 3, () => `T3.RR: replay self-recorded (recorded()=${bus.recorded()})`);
+    }
+
+    // -- A-RR-3: a re-entrant replay() throws /replay re-entered/ and restores the latch
+    //    The handler re-enters replay ONLY once armed, so the populating emit records
+    //    cleanly and the re-entry happens under the outer replay's re-drive.
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        c.value('bus', bus);
+        const arm = { on: false };
+        c.value('arm', arm);
+        class Reenter {
+            constructor(b, a) { this.bus = b; this.arm = a; }
+            handle() { if (this.arm.on) this.bus.replay(); }
+        }
+        bus.on('e', Reenter, ['bus', 'arm']);
+        bus.boot();
+        bus.record(4);
+        bus.emit('e', 1); // populates the tape; arm off, no re-entry
+        arm.on = true;
+        let threw = false;
+        try { bus.replay(); } catch (e) { threw = /replay re-entered/i.test(e.message); }
+        check(threw, () => 'T3.RR: a re-entrant replay() did not throw /replay re-entered/');
+        check(bus._replaying === false, () => 'T3.RR: _replaying latch not restored after a re-entrant throw');
+    }
+
+    // -- A-RR-5: replay() on a never-recorded / empty tape returns 0 (not a throw)
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        class L { handle() {} }
+        bus.on('e', L);
+        bus.boot();
+        check(bus.replay() === 0, () => 'T3.RR: replay() on a never-recorded tape did not return 0');
+        bus.record(4); // recording, but nothing emitted yet
+        check(bus.replay() === 0, () => 'T3.RR: replay() on an empty tape did not return 0');
+    }
+
+    // -- A-RR-7: replay is SYNCHRONOUS -- a flag set by the last replayed handler is
+    //    already true on the statement AFTER replay() (no microtask hop) ----------
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        let flag = false;
+        class L { handle() { flag = true; } }
+        bus.on('e', L);
+        bus.boot();
+        bus.record(4);
+        bus.emit('e', 1);
+        flag = false; // clear the live-emit set; only replay may set it now
+        bus.replay();
+        check(flag === true, () => 'T3.RR: replay() was not synchronous -- flag not set on the next statement');
+    }
+
+    // -- A-RR-5: capacity validation, double-record, and stopRecording -> record ---
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        class L { handle() {} }
+        bus.on('e', L);
+        bus.boot();
+        const bad = [0, -1, 1.5];
+        for (let i = 0; i < bad.length; i++) {
+            let msg = '';
+            try { bus.record(bad[i]); } catch (e) { msg = e.message; }
+            check(/capacity/i.test(msg), () => `T3.RR: record(${bad[i]}) did not throw naming capacity (msg=${msg})`);
+        }
+        bus.record(4);
+        let dbl = false;
+        try { bus.record(4); } catch (e) { dbl = /already recording/i.test(e.message); }
+        check(dbl, () => 'T3.RR: a second record() without stopRecording() did not throw');
+        bus.stopRecording();
+        let restart = true;
+        try { bus.record(4); } catch { restart = false; }
+        check(restart, () => 'T3.RR: record() after stopRecording() was rejected');
+    }
+
+    // -- A-RR-5: record / replay on a disposed bus fail closed (DISPOSED) ----------
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        class L { handle() {} }
+        bus.on('e', L);
+        bus.boot();
+        bus.dispose();
+        let recThrew = false;
+        try { bus.record(4); } catch (e) { recThrew = /disposed/i.test(e.message); }
+        check(recThrew, () => 'T3.RR: record() on a disposed bus did not throw DISPOSED');
+        let repThrew = false;
+        try { bus.replay(); } catch (e) { repThrew = /disposed/i.test(e.message); }
+        check(repThrew, () => 'T3.RR: replay() on a disposed bus did not throw DISPOSED');
+    }
+
+    // -- A-RR-4: 'throw' overflow throws inside emit; _depth + tape stay consistent
+    //    and the bus stays usable -------------------------------------------------
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        let calls = 0;
+        class L { handle() { calls++; } }
+        bus.on('e', L);
+        bus.boot();
+        bus.record(2, { onOverflow: 'throw' });
+        bus.emit('e', 1);
+        bus.emit('e', 2); // ring now full at capacity 2
+        check(calls === 2, () => `T3.RR: pre-overflow emits dispatched ${calls} != 2`);
+        let ovThrew = false;
+        try { bus.emit('e', 3); } catch (e) { ovThrew = /overflow/i.test(e.message); }
+        check(ovThrew, () => "T3.RR: a capacity+1 emit under onOverflow 'throw' did not throw");
+        check(bus._depth === 0, () => `T3.RR: _depth leaked after a throw-overflow (=${bus._depth})`);
+        check(bus.dropped() === 0, () => `T3.RR: dropped() ${bus.dropped()} != 0 under onOverflow throw`);
+        check(bus.recorded() === 2, () => `T3.RR: recorded() ${bus.recorded()} != 2 (capacity) under throw`);
+        check(calls === 2, () => `T3.RR: the overflow emit dispatched a listener (calls=${calls} != 2)`);
+        // Bus stays usable: stop recording, a plain emit still dispatches.
+        bus.stopRecording();
+        bus.emit('e', 4);
+        check(calls === 3, () => `T3.RR: bus not usable after a throw-overflow (calls=${calls} != 3)`);
+    }
+
+    // -- unknown record option fails closed with a did-you-mean hint --------------
+    {
+        const c = new Container();
+        const bus = new EventBus(c);
+        class L { handle() {} }
+        bus.on('e', L);
+        bus.boot();
+        let msg = '';
+        try { bus.record(4, { onOverflw: 'throw' }); } catch (e) { msg = e.message; }
+        check(/onOverflow/i.test(msg), () => `T3.RR: unknown record option missing did-you-mean (msg=${msg})`);
+        let bv = '';
+        try { bus.record(4, { onOverflow: 'nonsense' }); } catch (e) { bv = e.message; }
+        check(/onOverflow/i.test(bv), () => `T3.RR: bad onOverflow value not rejected (msg=${bv})`);
+    }
 }

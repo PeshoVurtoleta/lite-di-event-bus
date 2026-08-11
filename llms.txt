@@ -63,11 +63,45 @@ usable.
   awaited handler.
 - `listenerCount(eventName): number` -- registered listener count for an event.
 
+## Record and replay -- flight recorder (added 1.1.0)
+Opt-in, bounded tape that captures every emitted `(name, payload)` and can
+synchronously re-drive them through `emit`. Passive recorder, NOT a scheduler: it
+records what already fired in the same frame, and replay is a direct synchronous
+re-drive -- no queue, no microtask, no timer, no retries. Recording is a runtime
+method, not a constructor option, so the three exports and frozen OPTIONS are
+unchanged.
+- `record(capacity, opts?): this` -- begin capturing into a FIXED ring of exactly
+  `capacity` slots (allocated once). `opts.onOverflow`: 'drop-oldest' (default --
+  keep the most recent `capacity`, rotate, loss visible via dropped()) or 'throw'
+  (the capacity+1-th emit throws inside emit; bus stays usable). Fails closed:
+  disposed throws; non-integer/<= 0 capacity throws naming it; unknown option throws
+  with a did-you-mean hint; a second record() while recording throws.
+- `stopRecording(): this` -- halt capture, RETAIN tape + captured payloads so
+  replay() still works. Idempotent.
+- `replay(): number` -- synchronously re-drive every recorded entry through emit()
+  in capture order; return the count. Recording is suspended for the duration (latch
+  restored in finally) so replay never self-records. Empty/never-recorded returns 0.
+  Disposed throws; re-entrant replay() throws.
+- `recorded(): number` -- entries currently held (never exceeds capacity; 0 after
+  clearTape).
+- `dropped(): number` -- entries overwritten under 'drop-oldest' (loss VISIBLE via a
+  counter, never silent; always 0 under 'throw').
+- `clearTape(): this` -- release every retained payload reference (null the ring
+  slots so a WeakRef to a recorded payload is collectable) and reset
+  head/count/dropped. Ring arrays REUSED. Idempotent; recording continues if active.
+  dispose() also nulls the tape, so it never outlives the bus.
+
 ## Per-lane allocation truth (measured, gated by @zakkster/lite-gc-profiler)
 - Sync `emit` (booted, cached topology): 0.000 B/emit (HARD gate at 0, over 1e6
   emits, maxMajor 0). Unchanged at any nesting depth -- the T6 gate measures a
   4-deep nested cascade and still reads 0.000 B/emit (the depth push/pop and the
   try/finally add no allocation).
+- Sync `emit` with the recorder ON: 0.000 B/emit (SEPARATE 0-B lane -- capture is
+  pure reference stores into the pre-allocated ring). Recorder OFF (default) is
+  release-guarded to stay 0.000 B/emit: the hot path adds one `_tape === null` field
+  compare. (After stopRecording/clearTape, `_tape` stays non-null so emit pays a
+  `_capture` call that early-returns at still-0-B; only dispose restores the pure
+  single-compare.)
 - `emitAsync`: ~0.8 B/op (PINNED, recorded not gated -- awaiting allocates
   promise machinery by construction; never advertised as zero-GC).
 
@@ -113,6 +147,9 @@ bus.emit('order.placed', { id: 43 });   // throws: container shut down (fail clo
 - User needs a zero-allocation synchronous dispatch on a hot path.
 - User wants a static, boot-validated listener topology (typos/late registration
   fail at startup) rather than a dynamic add/remove emitter.
+- User wants a bounded, zero-alloc flight recorder over a hot emit path -- capture
+  the last N events and synchronously re-drive them (debugging, deterministic
+  replay, warm-start) without pulling in a scheduler or a queue.
 
 ## Not this package
 - A dynamic pub/sub emitter with runtime add/remove -> use a plain EventEmitter;

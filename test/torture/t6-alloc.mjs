@@ -29,6 +29,10 @@ import { runOpsGate, ALLOC_BREAK, BREAK, check, die, STATS } from './harness.mjs
 
 const HOT = 1000000;      // 1e6 emits (A1)
 const PIN_ASYNC = 512;    // B/op ceiling for emitAsync -- recorded, loosely pinned
+const REC_CAP = 1024;     // recorder-ON ring capacity (A2)
+
+/** One payload reference reused across every recorded emit -- a ref store is 0 B. */
+const REC_PAYLOAD = { tag: 'rec' };
 
 // Either break flag injects a retained per-emit allocation so the gate rejects:
 // DI_ALLOC_BREAK is the per-emit control; DI_TORTURE_BREAK is the whole-suite one.
@@ -103,6 +107,46 @@ export async function run() {
     }
     if (INJECT) die('T6.A1: DI_ALLOC_BREAK injected allocations but laneB gate passed');
 
+    // ---- A2: recorder-ON lane -- fixed ring, 0 B/emit steady-state ----------
+    // A SEPARATE gate from A1: recording deliberately RETAINS payload refs, but the
+    // steady-state capture is reference stores into a PRE-SIZED ring at a rolling
+    // head -- no growth, no per-emit allocation. Warmed past capacity so every
+    // measured emit is a drop-oldest OVERWRITE (the fullest-work path).
+    const rc = new Container();
+    let rhits = 0;
+    const rbus = new EventBus(rc);
+    class RL { handle(p) { rhits += (p === REC_PAYLOAD ? 1 : 0); } }
+    rbus.on('rec', RL);
+    rbus.boot();
+    rbus.record(REC_CAP);
+    for (let i = 0; i < REC_CAP * 4; i++) rbus.emit('rec', REC_PAYLOAD);
+
+    const lr = measureAllocs(
+        () => { rbus.emit('rec', REC_PAYLOAD); if (INJECT) sink.push(new Float64Array(8)); },
+        { iterations: 5000, batches: 12, warmup: 5000 });
+    const cr = checkAllocs(lr, { maxBytesPerCall: 0 });
+    check(cr.verdict === 'pass' && lr.bytesPerCall === 0,
+        () => `T6.A2: recorder-ON emit must be 0 B/emit, measured ${lr.bytesPerCall} (verdict=${cr.verdict})` +
+            (INJECT ? ' (break control -- expected)' : ''));
+    if (INJECT) die('T6.A2: DI_ALLOC_BREAK injected allocations but the recorder-ON lane passed');
+    sink.length = 0;
+    check(rbus.recorded() <= REC_CAP,
+        () => `T6.A2: recorded() ${rbus.recorded()} exceeded capacity ${REC_CAP}`);
+
+    // Accounting: a fresh 1e6-emit run. drop-oldest must account for every overwrite,
+    // so recorded()+dropped() === total emitted and recorded() pins at capacity.
+    const ac = new Container();
+    const abus = new EventBus(ac);
+    class AL { handle() {} }
+    abus.on('rec', AL);
+    abus.boot();
+    abus.record(REC_CAP);
+    for (let i = 0; i < HOT; i++) abus.emit('rec', REC_PAYLOAD);
+    check(abus.recorded() === REC_CAP,
+        () => `T6.A2: recorded() ${abus.recorded()} != ${REC_CAP} after ${HOT} emits`);
+    check(abus.recorded() + abus.dropped() === HOT,
+        () => `T6.A2: recorded()+dropped() = ${abus.recorded() + abus.dropped()} != ${HOT} (drop-oldest lost accounting)`);
+
     // ---- Async lane: emitAsync (leaf event) -- RECORDED, loosely PINNED ------
     const as = await measureOpsAsync(async () => { await bus.emitAsync('e3', payload); },
         { ops: 50000, warmup: 5000 });
@@ -113,8 +157,9 @@ export async function run() {
     // Diagnostic line (stderr): the honest per-lane baseline this run measured.
     process.stderr.write(
         'T6 lanes: emit=' + la.bytesPerCall.toFixed(3) + ' B/emit (' + HOT + ' ops)' +
+        ' recorderOn=' + lr.bytesPerCall.toFixed(3) + ' B/emit' +
         ' emitAsync=' + as.bytesPerOp.toFixed(3) + ' B/op' +
         ' | laneB major=' + summary.gc.major + ' minor=' + summary.gc.minor +
         ' maxMs=' + summary.gc.maxMs.toFixed(3) + ' abGrowth=' + summary.arrayBuffers.growthBytes +
-        ' | hits=' + hits + '\n');
+        ' | hits=' + hits + ' rhits=' + rhits + '\n');
 }

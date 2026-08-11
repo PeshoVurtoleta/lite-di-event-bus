@@ -71,6 +71,7 @@ bus.emit('order.placed', { id: 43 });    // throws: Container shut down (fail cl
   - [Constructor](#constructor)
   - [Methods](#methods)
   - [Constants](#constants)
+- [Record and replay (flight recorder)](#record-and-replay-flight-recorder)
 - [Composability with the container](#composability-with-the-container)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -196,8 +197,62 @@ listenerCount(eventName: string): number
 
 | Export    | Type               | Meaning                                            |
 | --------- | ------------------ | -------------------------------------------------- |
-| `VERSION` | `string`           | Three-place-synced version (`1.0.0`).      |
+| `VERSION` | `string`           | Three-place-synced version (`1.1.0`).      |
 | `OPTIONS` | `readonly string[]`| Frozen `['onError']` -- the only valid option keys.|
+
+## Record and replay (flight recorder)
+
+Added in 1.1.0. An opt-in, bounded tape that captures every emitted
+`(name, payload)` and can synchronously re-drive them back through `emit`. It is a
+**passive recorder, not a scheduler**: it records what already fired in the same
+frame, and `replay()` is a direct synchronous re-drive -- no queue, no microtask, no
+timer, no retries. Recording is a runtime method, not a constructor option, so the
+three exports and the frozen `OPTIONS` are unchanged.
+
+```typescript
+record(capacity: number, opts?: { onOverflow?: 'drop-oldest' | 'throw' }): this
+stopRecording(): this
+replay(): number
+recorded(): number
+dropped(): number
+clearTape(): this
+```
+
+- `record` -- begin capturing into a FIXED ring of exactly `capacity` slots,
+  allocated once. `onOverflow` is the full-ring policy: `'drop-oldest'` (default --
+  flight-recorder semantics: keep the most recent `capacity` events, rotate, and make
+  loss visible via `dropped()`) or `'throw'` (exact-capture: the `capacity+1`-th emit
+  throws inside `emit`; the bus stays usable). Fails closed -- disposed bus throws; a
+  non-integer or `<= 0` capacity throws naming it; an unknown option throws with a
+  did-you-mean hint; a second `record()` while already recording throws.
+- `stopRecording` -- halt capture but RETAIN the tape and captured payloads so
+  `replay()` still works. Idempotent.
+- `replay` -- synchronously re-drive every recorded entry through `emit()` in capture
+  order and return the count. Recording is suspended for the duration (a latch,
+  restored in `finally`) so the re-drive never self-records. An empty or
+  never-recorded tape returns `0`. Disposed bus throws; a re-entrant `replay()`
+  throws.
+- `recorded` / `dropped` -- entries currently held (never exceeds `capacity`) and
+  entries overwritten under `'drop-oldest'` (loss is VISIBLE via a counter, never a
+  silent drop; always `0` under `'throw'`).
+- `clearTape` -- release every retained payload reference (null the ring slots so a
+  `WeakRef` to a recorded payload becomes collectable) and reset head/count/dropped.
+  The ring arrays are REUSED. Idempotent; recording continues if active. `dispose()`
+  also nulls the tape, so it never outlives the bus.
+
+```javascript
+const bus = new EventBus(c);
+bus.on('order.placed', Audit, ['log']).boot();
+
+bus.record(1024);                          // ring of 1024, drop-oldest by default
+bus.emit('order.placed', { id: 1 });
+bus.emit('order.placed', { id: 2 });
+bus.stopRecording();                       // keeps the tape for replay
+
+bus.recorded();                            // 2
+bus.replay();                              // re-drives both through emit(), returns 2
+bus.clearTape();                           // releases the captured payloads
+```
 
 ## Composability with the container
 
@@ -253,6 +308,7 @@ claimed to be zero.
 | ----------------------------- | --------------- | ---------------------------------------- |
 | `emit` (booted, cached)       | 0.000 B/emit    | HARD gate at 0 over 1e6 emits, maxMajor 0 |
 | `emit` (4-deep nested cascade)| 0.000 B/emit    | same gate, measured body cascades 4 deep |
+| `emit` (recorder ON)          | 0.000 B/emit    | separate 0-B lane: pure ref stores into the ring |
 | `emitAsync`                   | ~0.8 B/op       | PINNED (recorded, not gated at zero)     |
 
 What makes 0 B/emit possible: the container owns the listener instances (no
@@ -264,6 +320,17 @@ boot (8 buffers, each sized to the largest listener count), so a nested emit tak
 the next buffer instead of allocating one, and `getAllInto` never needs its
 `RangeError` branch at any depth. A cascade past depth 8 throws (fail closed)
 rather than allocating unbounded stack.
+
+The 1.1.0 flight recorder is release-guarded to preserve this: with the recorder
+off (the default), the hot path adds exactly one `this._tape === null` field compare
+and still measures 0.000 B/emit. Recorder ON is a SEPARATE 0-B lane -- capture is
+pure reference stores into the ring allocated once by `record()`, never a per-emit
+allocation. One nuance worth knowing: `_tape === null` is the pure single-compare
+path (never recorded, or after `dispose()`); once a tape exists, `stopRecording()`
+and `clearTape()` leave `_tape` non-null, so `emit` pays a `_capture` call that
+early-returns at still-0-B rather than the bare compare. That is by design --
+retaining the tape is what lets `replay()` work after `stopRecording()` -- and only
+`dispose()` restores the pure single-compare. No allocation on either path.
 
 Numbers reproduce with `node --expose-gc test/torture.mjs` (gated by
 `@zakkster/lite-gc-profiler`; retention proven by `@zakkster/lite-leak`).
@@ -296,12 +363,15 @@ Numbers reproduce with `node --expose-gc test/torture.mjs` (gated by
 
 ## Testing
 
-- `npm test` -- 15 `node:test` cases (behavioural coverage).
+- `npm test` -- 88 `node:test` cases (behavioural coverage, incl. the record/replay
+  boundary suite `test/EventBus.record-replay.test.js`).
 - `npm run torture` -- `node --expose-gc test/torture.mjs`: T0 dispatch laws, T3
-  lifecycle, T5 fuzz (32 seeds x 2000 iters), T6 the 0 B/emit gate (1e6 emits) +
-  the async lane, T7 soak (2000 cycles, lite-leak retention + heap bound), T9
-  controls (each gate proven able to fail: `DI_ASCII_BREAK`, `DI_ALLOC_BREAK`,
-  `DI_TORTURE_BREAK`).
+  lifecycle + record/replay contract (capture order/identity, no-self-record,
+  re-entrant-replay throw, empty-returns-0), T5 fuzz (32 seeds x 2000 iters), T6 the
+  0 B/emit gate (1e6 emits) with the recorder-ON lane also at 0.000 B/emit + the
+  async lane, T7 soak (2000 cycles + 500 record rounds, lite-leak retention incl. a
+  WeakRef-to-cleared-payload collectability proof + heap bound), T9 controls (each
+  gate proven able to fail: `DI_ASCII_BREAK`, `DI_ALLOC_BREAK`, `DI_TORTURE_BREAK`).
 - `npm run example` -- [`examples/order-pipeline.mjs`](examples/order-pipeline.mjs): a
   shipped, self-verifying reference consumer. An order-processing fan-out with
   DI-constructed listeners, a nested emit (`order.placed` -> a handler emits
@@ -309,7 +379,7 @@ Numbers reproduce with `node --expose-gc test/torture.mjs` (gated by
   and the fail-closed paths (on()-after-boot, unknown event, unknown option, non-function
   onError, null container, post-shutdown emit, the distinct post-dispose emit, and the
   depth-8 runaway guard). Every claim is asserted with `node:assert`, so a broken
-  contract exits non-zero. It is the downstream proof that the 1.0.0 API works in anger.
+  contract exits non-zero. It is the downstream proof that the shipped API works in anger.
 - `npm run verify` -- all three, in order. `prepublishOnly` runs `verify`.
 
 ## What this is not
@@ -318,7 +388,9 @@ Numbers reproduce with `node --expose-gc test/torture.mjs` (gated by
   static and boot-locked by design. For loose listeners, use a plain
   `EventEmitter`.
 - Not a scheduler. No queue, no microtask hop, no retries, no backpressure; emit
-  is a direct synchronous fan-out in registration order.
+  is a direct synchronous fan-out in registration order. The 1.1.0 flight recorder
+  keeps this line: it is a passive tape, and `replay()` is a synchronous re-drive
+  through `emit`, not deferred or reordered delivery.
 - Not the container. Wiring, lifetimes, scopes, and teardown live in
   `@zakkster/lite-di-container` (the peer dependency).
 

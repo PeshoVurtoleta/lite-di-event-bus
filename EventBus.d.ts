@@ -25,6 +25,18 @@ export interface EventBusOptions {
     onError?: OnError;
 }
 
+/** Full-ring overflow policy for the flight recorder. */
+export type OnOverflow = 'drop-oldest' | 'throw';
+
+export interface RecordOptions {
+    /**
+     * Full-ring policy: 'drop-oldest' (default -- keep the most recent `capacity`
+     * events, rotate, loss visible via dropped()) or 'throw' (the capacity+1-th
+     * emit throws inside emit; the bus stays usable).
+     */
+    onOverflow?: OnOverflow;
+}
+
 /**
  * A boot-locked, DI-constructed event topology over a container `multi` binding.
  * Listeners are classes with a `handle(payload)` method; the container builds and
@@ -54,9 +66,41 @@ export declare class EventBus {
     emitAsync(eventName: string, payload?: unknown): Promise<void>;
 
     /**
-     * Release the bus: null the container, shared buffer, counts map, and error
-     * sink. After dispose, emit* and on() fail closed (throw). Call on a
-     * long-lived bus once the container has shut down.
+     * Begin capturing every emitted (name, payload) into a FIXED ring of exactly
+     * `capacity` slots (added 1.1.0). Passive recorder, not a scheduler. Fails
+     * closed: disposed throws; a non-integer or <= 0 capacity throws; an unknown
+     * option throws; a second record() while already recording throws.
+     */
+    record(capacity: number, opts?: RecordOptions): this;
+
+    /** Halt capture but RETAIN the tape + payloads so replay() still works. Idempotent. */
+    stopRecording(): this;
+
+    /**
+     * Synchronously re-drive every recorded entry through emit() in capture order;
+     * return the count. Recording is suspended for the duration so replay never
+     * self-records. Empty/never-recorded returns 0. Disposed throws; re-entrant
+     * replay() throws.
+     */
+    replay(): number;
+
+    /** Entries currently held in the tape (never exceeds capacity; 0 after clearTape). */
+    recorded(): number;
+
+    /** Entries overwritten under 'drop-oldest' (loss visible; always 0 under 'throw'). */
+    dropped(): number;
+
+    /**
+     * Release every retained payload reference (so a WeakRef to a recorded payload
+     * is collectable) and reset the tape counters. Ring arrays are reused.
+     * Idempotent; recording continues if it was active.
+     */
+    clearTape(): this;
+
+    /**
+     * Release the bus: null the container, shared buffer, counts map, error sink,
+     * and the recorder tape. After dispose, emit* and on() fail closed (throw).
+     * Call on a long-lived bus once the container has shut down.
      */
     dispose(): this;
 }

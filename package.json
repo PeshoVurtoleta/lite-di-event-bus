@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-di-event-bus",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "description": "DI-constructed static event handlers under a boot-locked multi topology, dispatched by index over a shared buffer. Zero allocation on the synchronous emit path.",
   "type": "module",

@@ -13,7 +13,7 @@
  * in one commit or not at all.
  * @type {string}
  */
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 /**
  * The only accepted constructor option keys. Frozen so an unknown key is an
@@ -129,6 +129,14 @@ export class EventBus {
         this._depth = 0;
         this._maxCount = 0;
         this._booted = false;
+
+        // Flight recorder (1.1, GAP-5). Single source of truth: _tape === null means
+        // no ring is allocated (the release-guarding hot path is one compare against
+        // this). A tape object holds pre-sized parallel arrays and its own rolling
+        // head/count/dropped so the recording-on lane is 0 B/op too. _replaying is the
+        // re-drive latch -- replay() sets it so the re-driven emits do not self-record.
+        this._tape = null;
+        this._replaying = false;
     }
 
     // === Registration (cold path -- pre-boot only) =========================
@@ -215,6 +223,11 @@ export class EventBus {
         const d = this._depth;
         if (d >= MAX_DEPTH) throw new Error('[EventBus] emit nesting too deep (max ' + MAX_DEPTH + ')');
         try {
+            // Recorder hook: exactly one field compare when off (the release-guarding
+            // A1 gate). On tape, _capture does reference stores into the pre-allocated
+            // ring -- no per-emit allocation. Inside the try so a 'throw'-overflow
+            // fail-closed still restores _depth via the finally.
+            if (this._tape !== null) this._capture(eventName, payload);
             const buf = this._bufStack[this._depth++];
             const n = this._container.getAllInto(eventName, buf);
             for (let i = 0; i < n; i++) buf[i].handle(payload);
@@ -237,6 +250,7 @@ export class EventBus {
         const d = this._depth;
         if (d >= MAX_DEPTH) throw new Error('[EventBus] emit nesting too deep (max ' + MAX_DEPTH + ')');
         try {
+            if (this._tape !== null) this._capture(eventName, payload);
             const buf = this._bufStack[this._depth++];
             const n = this._container.getAllInto(eventName, buf);
             for (let i = 0; i < n; i++) _callSafe(buf[i], payload, eventName, onError);
@@ -264,6 +278,9 @@ export class EventBus {
         const onError = this._onError;
         const d = this._depth;
         if (d >= MAX_DEPTH) throw new Error('[EventBus] emit nesting too deep (max ' + MAX_DEPTH + ')');
+        // Capture before the slot is taken; a 'throw'-overflow throws before _depth
+        // is incremented, so the bus stays usable with no depth leak.
+        if (this._tape !== null) this._capture(eventName, payload);
         const buf = this._bufStack[this._depth++];
         let listeners;
         try {
@@ -284,6 +301,182 @@ export class EventBus {
         }
     }
 
+    // === Flight recorder (record / replay -- 1.1, GAP-5) ==================
+
+    /**
+     * On-tape hook. Called only when this._tape !== null (the hot path already
+     * paid that one compare). Zero allocation: reference stores into the
+     * pre-allocated ring at the rolling head. Skips while replaying (the re-drive
+     * must not self-record) and while the tape is stopped. Under 'drop-oldest' a
+     * full ring rotates over the oldest slot and increments dropped(); under
+     * 'throw' a full ring throws inside emit (fail closed) BEFORE mutating the
+     * head, so the tape stays consistent and the bus usable.
+     * @param {string} eventName
+     * @param {unknown} payload
+     */
+    _capture(eventName, payload) {
+        if (this._replaying) return;
+        const tape = this._tape;
+        if (!tape.active) return;
+        const cap = tape.capacity;
+        if (tape.count === cap) {
+            if (tape.onOverflow === 'throw') {
+                throw new Error('[EventBus] record tape overflow: capacity ' + cap +
+                    " reached under onOverflow 'throw'.");
+            }
+            tape.dropped++;
+        } else {
+            tape.count++;
+        }
+        let head = tape.head;
+        tape.names[head] = eventName;
+        tape.payloads[head] = payload;
+        head++;
+        if (head === cap) head = 0;
+        tape.head = head;
+    }
+
+    /**
+     * Begin capturing every emitted (name, payload) into a FIXED ring of exactly
+     * `capacity` slots, pre-allocated once here. The recorder is a passive tape:
+     * it records what already fired in the same synchronous frame -- it never
+     * defers, reorders, or re-delivers. NOT a scheduler.
+     *
+     * `opts.onOverflow` picks the full-ring policy: 'drop-oldest' (default,
+     * flight-recorder semantics -- keep the most recent `capacity` events, rotate,
+     * and make loss visible via dropped()) or 'throw' (exact-capture semantics --
+     * the capacity+1-th emit throws inside emit; the bus stays usable).
+     *
+     * Fails closed: disposed bus throws; non-integer or <= 0 `capacity` throws
+     * naming it; a second record() while already recording throws (stopRecording()
+     * first to restart).
+     * @param {number} capacity
+     * @param {{ onOverflow?: 'drop-oldest' | 'throw' }} [opts]
+     * @returns {this}
+     */
+    record(capacity, opts) {
+        if (this._container === null) throw new Error(DISPOSED);
+        if (this._tape !== null && this._tape.active) {
+            throw new Error('[EventBus] already recording -- call stopRecording() before record().');
+        }
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) || capacity <= 0) {
+            throw new RangeError('[EventBus] record(capacity): capacity must be a positive integer, got ' +
+                String(capacity) + '.');
+        }
+        let onOverflow = 'drop-oldest';
+        if (opts !== null && opts !== undefined) {
+            for (const key in opts) {
+                if (key !== 'onOverflow') {
+                    throw new Error("[EventBus] record: unknown option '" + key +
+                        "'. Did you mean 'onOverflow'?");
+                }
+            }
+            if (opts.onOverflow !== undefined) {
+                if (opts.onOverflow !== 'drop-oldest' && opts.onOverflow !== 'throw') {
+                    throw new Error("[EventBus] record: onOverflow must be 'drop-oldest' or 'throw', got '" +
+                        String(opts.onOverflow) + "'.");
+                }
+                onOverflow = opts.onOverflow;
+            }
+        }
+        this._tape = {
+            names: new Array(capacity),
+            payloads: new Array(capacity),
+            head: 0,
+            count: 0,
+            dropped: 0,
+            capacity: capacity,
+            onOverflow: onOverflow,
+            active: true,
+        };
+        return this;
+    }
+
+    /**
+     * Stop capturing. The tape and every retained payload reference are KEPT so
+     * replay() still works; call clearTape() to release them. Idempotent -- safe
+     * to call when not recording or never recorded.
+     * @returns {this}
+     */
+    stopRecording() {
+        if (this._tape !== null) this._tape.active = false;
+        return this;
+    }
+
+    /**
+     * Synchronously re-drive every recorded entry through emit(), in capture
+     * order, before the next statement runs (NOT scheduled -- no timer, no
+     * microtask, no queue). Returns the count replayed. Recording is suspended for
+     * the duration via the _replaying latch (restored in finally), so the re-drive
+     * does not self-record. A never-recorded or empty tape returns 0 (absence is a
+     * valid empty, not an error). Disposed bus throws; a re-entrant replay() throws.
+     * @returns {number}
+     */
+    replay() {
+        if (this._container === null) throw new Error(DISPOSED);
+        if (this._replaying) throw new Error('[EventBus] replay re-entered.');
+        const tape = this._tape;
+        if (tape === null) return 0;
+        const count = tape.count;
+        if (count === 0) return 0;
+        const cap = tape.capacity;
+        const names = tape.names;
+        const payloads = tape.payloads;
+        // When full the oldest entry sits at head; otherwise entries fill 0..count-1.
+        const start = count === cap ? tape.head : 0;
+        this._replaying = true;
+        try {
+            for (let i = 0; i < count; i++) {
+                let idx = start + i;
+                if (idx >= cap) idx -= cap;
+                this.emit(names[idx], payloads[idx]);
+            }
+        } finally {
+            this._replaying = false;
+        }
+        return count;
+    }
+
+    /**
+     * Entries currently held in the tape (0 when never recorded or after
+     * clearTape). Never exceeds the recording capacity.
+     * @returns {number}
+     */
+    recorded() {
+        return this._tape === null ? 0 : this._tape.count;
+    }
+
+    /**
+     * Entries overwritten under 'drop-oldest' overflow -- makes loss VISIBLE
+     * (fail-loud via a counter, never a silent drop). Always 0 under 'throw'.
+     * @returns {number}
+     */
+    dropped() {
+        return this._tape === null ? 0 : this._tape.dropped;
+    }
+
+    /**
+     * Release every retained payload reference (null the slots so a WeakRef to a
+     * recorded payload becomes collectable) and reset head/count/dropped. The ring
+     * arrays are REUSED, not reallocated. Idempotent. Recording continues if it was
+     * active -- clearTape only empties the tape, it does not stop it.
+     * @returns {this}
+     */
+    clearTape() {
+        const tape = this._tape;
+        if (tape === null) return this;
+        const names = tape.names;
+        const payloads = tape.payloads;
+        for (let i = 0; i < names.length; i++) {
+            names[i] = null;
+            payloads[i] = null;
+        }
+        tape.head = 0;
+        tape.count = 0;
+        tape.dropped = 0;
+        return this;
+    }
+
     /**
      * Release the bus. Nulls the container reference, the buffer stack (whose
      * buffers can pin torn-down instances), the counts map, and the error sink,
@@ -299,6 +492,10 @@ export class EventBus {
         this._counts = null;
         this._onError = null;
         this._booted = false;
+        // Fail closed: the tape must never outlive the bus. Nulling it releases the
+        // ring arrays and every retained payload reference in one shot.
+        this._tape = null;
+        this._replaying = false;
         return this;
     }
 }
