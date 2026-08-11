@@ -196,7 +196,7 @@ listenerCount(eventName: string): number
 
 | Export    | Type               | Meaning                                            |
 | --------- | ------------------ | -------------------------------------------------- |
-| `VERSION` | `string`           | Three-place-synced version (`1.0.0-alpha.1`).      |
+| `VERSION` | `string`           | Three-place-synced version (`1.0.0`).      |
 | `OPTIONS` | `readonly string[]`| Frozen `['onError']` -- the only valid option keys.|
 
 ## Composability with the container

@@ -5,6 +5,51 @@ format follows Keep a Changelog; the project uses semantic versioning. The
 version is synced in three places at once: `package.json`, the `VERSION` const in
 `EventBus.js`, and this file's top entry.
 
+## [1.0.0] - 2026-08-11
+
+Promotion to stable. The public surface is frozen exactly as shipped at
+`1.0.0-alpha.1` -- the `EventBus` class (`on`, `boot`, `emit`, `emitSafe`,
+`emitAsync`, `listenerCount`, `dispose`), plus `VERSION` and the frozen `OPTIONS`. No
+exports added or removed.
+
+### Changed
+- The retention gate is now a real finalization residual, not a `size() === 0`
+  tautology. The soak tracks each build/emit/dispose cycle WITHOUT untracking,
+  settles hard, and asserts the finalization residual stays within a fixed ceiling
+  (`size() <= 16`) that does NOT scale with cycle count -- so a per-cycle leak trips
+  it directly, not merely a heap backstop. Behavior unchanged; this is the gate that
+  now PROVES leak-freedom.
+
+### Proven
+- Downstream consumer: `examples/order-pipeline.mjs`, a self-verifying reference app
+  that boots a real container, registers listeners as DI-constructed classes, and
+  asserts synchronous fan-out order, re-entrant (nested) emit correctness, the
+  `emitSafe` error-isolation path, and the post-shutdown fail-closed throw with
+  `node:assert`. `npm run example` is a hard gate folded into `verify` /
+  `prepublishOnly`.
+- `node --expose-gc test/torture.mjs`: `emit` measures 0.000 B/emit over 1,000,000
+  emits WITH a 4-deep re-entrant cascade in the measured body; `emitAsync` is a
+  PINNED lane that allocates promise machinery by construction (this run 0.885 B/op,
+  recorded, never advertised as zero). A soak of 2,000 fresh + 500 dispose + 500
+  nested rounds leaves the finalization residual within the ceiling (this run
+  `size() 1/16`), `gc major=0 minor=0`. The `DI_ALLOC_BREAK` (per-emit alloc) and
+  `DI_TORTURE_BREAK` (whole-suite) controls plus the ASCII-source gate each force a
+  non-zero exit.
+- `node:test`: 45/45 pass.
+
+### API frozen at 1.0.0
+The public surface is exactly the `EventBus` class, `VERSION`, and `OPTIONS`.
+Deliberately NOT included -- any would be a post-1.0.0 (1.1) change, never a 1.0.x
+slip:
+- NOT a dynamic pub/sub emitter -- there is no runtime add/remove; the topology is
+  static and boot-locked. For loose listeners, use a plain `EventEmitter`.
+- NOT a scheduler -- no queue, no microtask hop, no retries, no backpressure; `emit`
+  is a direct synchronous fan-out in registration order.
+- NOT the container -- wiring, lifetimes, and teardown live in
+  `@zakkster/lite-di-container` (peer).
+- Re-entrant `emit` stays bounded at MAX_DEPTH 8 (fail closed), and `emitAsync`
+  stays PINNED (allocates by construction; never gated at 0).
+
 ## [1.0.0-alpha.1] - 2026-08-09
 
 First scoped release, built on the shipped `@zakkster/lite-di-container` v2.0.0
@@ -61,4 +106,5 @@ package exists to exercise).
 - ASCII-only source; zero runtime dependencies (the container is a peer
   dependency, not bundled).
 
+[1.0.0]: https://www.npmjs.com/package/@zakkster/lite-di-event-bus
 [1.0.0-alpha.1]: https://www.npmjs.com/package/@zakkster/lite-di-event-bus
